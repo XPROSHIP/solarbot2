@@ -51,6 +51,7 @@ app.get('/progress', (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders(); // RENDER PROXY'SİNİ AÇIK TUTMAK İÇİN ŞART
     scrapingStatus.clients.push(res);
     req.on('close', () => { scrapingStatus.clients = scrapingStatus.clients.filter(c => c !== res); });
 });
@@ -223,6 +224,6 @@ const browser = await puppeteer.launch({
     }
 });
 
-app.listen(PORT, () => {
-    console.log(`Sunucu http://localhost:${PORT} adresinde aktif. Tarayıcıdan açabilirsiniz.`);
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Sunucu http://0.0.0.0:${PORT} adresinde aktif. Dış bağlantılara açık.`);
 });
