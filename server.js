@@ -89,7 +89,8 @@ async function scrapeIdeasoft(page, site) {
             let devam = true;
             let oncekiVeri = "";
             
-            while(devam && sayfa <= 15) { 
+            // DİKKAT: Bedava RAM sınırını aşmamak için sayfa derinliği 15'ten 3'e düşürüldü.
+            while(devam && sayfa <= 3) { 
                 try {
                     let link = site.url + url + (url.includes('?') ? '&' : '?') + 'sayfa=' + sayfa;
                     await page.goto(link, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -166,26 +167,35 @@ async function scrapeCustom(page, site) {
     } catch(e) { return []; }
 }
 
+const launchOptions = { 
+    headless: "new", 
+    args: [
+        '--no-sandbox', 
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--single-process',
+        '--no-zygote',
+        '--js-flags="--max-old-space-size=256"'
+    ] 
+};
+
 app.post('/start', async (req, res) => {
     if (scrapingStatus.isRunning) return res.status(400).json({ error: "Zaten çalışıyor" });
     res.json({ success: true });
     scrapingStatus.isRunning = true;
     
     let globalVeritabani = [];
-    const browser = await puppeteer.launch({ 
-        headless: "new", 
-        args: [
-            '--no-sandbox', 
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
-            '--single-process',
-            '--no-zygote'
-        ] 
-    });
+    let browser = await puppeteer.launch(launchOptions);
 
     try {
         for (let i = 0; i < SITES.length; i++) {
+            // RAM TEMİZLİĞİ: Her 3 sitede bir tarayıcıyı kapatıp açarak belleği sıfırla.
+            if (i > 0 && i % 3 === 0) {
+                await browser.close();
+                browser = await puppeteer.launch(launchOptions);
+            }
+
             const site = SITES[i];
             sendSSE({ type: 'info', msg: `Taranıyor: ${site.magaza_adi}`, percent: Math.round(((i + 1) / SITES.length) * 100) });
             
@@ -218,7 +228,6 @@ app.post('/start', async (req, res) => {
         }
 
         globalVeritabani = [...new Map(globalVeritabani.map(item => [item.link, item])).values()];
-
         fs.writeFileSync(path.join(__dirname, 'KamuSolar_Veritabani.json'), JSON.stringify(globalVeritabani, null, 2), 'utf-8');
 
         const workbook = new ExcelJS.Workbook();
@@ -236,7 +245,7 @@ app.post('/start', async (req, res) => {
     } catch (err) {
         sendSSE({ type: 'info', msg: "Hata oluştu", percent: 0 });
     } finally {
-        await browser.close();
+        if(browser) await browser.close();
         scrapingStatus.isRunning = false;
     }
 });
