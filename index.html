@@ -596,57 +596,66 @@
             }
 
             function ara() {
-                const query = document.getElementById('searchInput').value.trim().toLowerCase();
-                if(!query && !showFavoritesOnly) {
-                    document.getElementById('list-container').innerHTML = '';
-                    document.getElementById('actionPanel').style.display = 'none';
-                    return;
-                }
+    const query = document.getElementById('searchInput').value.trim().toLowerCase();
+    if(!query && !showFavoritesOnly) {
+        document.getElementById('list-container').innerHTML = '';
+        document.getElementById('actionPanel').style.display = 'none';
+        return;
+    }
 
-                document.getElementById('selectAll').checked = false;
-                showFavoritesOnly = false; 
-                document.getElementById('favToggleBtn').classList.remove('active');
-                selectedBrand = null; 
+    document.getElementById('selectAll').checked = false;
+    showFavoritesOnly = false; 
+    document.getElementById('favToggleBtn').classList.remove('active');
+    selectedBrand = null; 
 
-                let aramaKelimeleri = query.split(/\s+/).filter(k => k.length > 1);
-                let temizKelimeler = aramaKelimeleri.filter(k => !markalar.has(k));
-                
-                let islenmisVeri = [];
-                
-                if(aramaKelimeleri.length > 0) {
-                    islenmisVeri = localDatabase.filter(v => {
-                        const baslik = v.urunAdi.toLowerCase();
-                        let eslesen1 = 0;
-                        aramaKelimeleri.forEach(k => { if(baslik.includes(k)) eslesen1++; });
-                        const oran1 = eslesen1 / aramaKelimeleri.length;
-
-                        let oran2 = 0;
-                        if(temizKelimeler.length > 0) {
-                            let eslesen2 = 0;
-                            temizKelimeler.forEach(k => { if(baslik.includes(k)) eslesen2++; });
-                            oran2 = eslesen2 / temizKelimeler.length;
-                        }
-                        return oran1 >= 0.50 || oran2 >= 0.50;
-                    });
-                } else {
-                    islenmisVeri = [...localDatabase];
-                }
-
-                if(islenmisVeri.length > 3) {
-                    const fiyatlar = islenmisVeri.map(v => v.fiyatRaw).sort((a,b) => a-b);
-                    const mid = Math.floor(fiyatlar.length / 2);
-                    const medyan = fiyatlar.length % 2 !== 0 ? fiyatlar[mid] : (fiyatlar[mid - 1] + fiyatlar[mid]) / 2;
-                    
-                    const minFiyat = medyan * 0.15;
-                    const maxFiyat = medyan * 15.0;
-
-                    islenmisVeri = islenmisVeri.filter(v => v.isKamu || (v.fiyatRaw >= minFiyat && v.fiyatRaw <= maxFiyat));
-                }
-
-                fetchedData = islenmisVeri;
-                extractBrands(fetchedData);
-                applyFiltersAndRender();
+    let aramaKelimeleri = query.split(/\s+/).filter(k => k.length > 1);
+    let temizKelimeler = aramaKelimeleri.filter(k => !markalar.has(k));
+    let icindeMarkaVarMi = aramaKelimeleri.length !== temizKelimeler.length;
+    
+    let islenmisVeri = [];
+    
+    if(aramaKelimeleri.length > 0) {
+        islenmisVeri = localDatabase.filter(v => {
+            const baslik = v.urunAdi.toLowerCase();
+            
+            if (v.isKamu && icindeMarkaVarMi) {
+                if (temizKelimeler.length === 0) return true;
+                let eslesen = 0;
+                temizKelimeler.forEach(k => { if(baslik.includes(k)) eslesen++; });
+                return (eslesen / temizKelimeler.length) >= 0.50;
             }
+            
+            let eslesen1 = 0;
+            aramaKelimeleri.forEach(k => { if(baslik.includes(k)) eslesen1++; });
+            const oran1 = eslesen1 / aramaKelimeleri.length;
+
+            let oran2 = 0;
+            if(temizKelimeler.length > 0) {
+                let eslesen2 = 0;
+                temizKelimeler.forEach(k => { if(baslik.includes(k)) eslesen2++; });
+                oran2 = eslesen2 / temizKelimeler.length;
+            }
+            return oran1 >= 0.50 || oran2 >= 0.50;
+        });
+    } else {
+        islenmisVeri = [...localDatabase];
+    }
+
+    if(islenmisVeri.length > 3) {
+        const fiyatlar = islenmisVeri.map(v => v.fiyatRaw).sort((a,b) => a-b);
+        const mid = Math.floor(fiyatlar.length / 2);
+        const medyan = fiyatlar.length % 2 !== 0 ? fiyatlar[mid] : (fiyatlar[mid - 1] + fiyatlar[mid]) / 2;
+        
+        const minFiyat = medyan * 0.15;
+        const maxFiyat = medyan * 15.0;
+
+        islenmisVeri = islenmisVeri.filter(v => v.isKamu || (v.fiyatRaw >= minFiyat && v.fiyatRaw <= maxFiyat));
+    }
+
+    fetchedData = islenmisVeri;
+    extractBrands(fetchedData);
+    applyFiltersAndRender();
+}
 
             function extractBrands(dataList) {
                 const foundBrands = new Set();
