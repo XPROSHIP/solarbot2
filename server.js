@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
-const puppeteer = require('puppeteer');
+const axios = require('axios');
+const cheerio = require('cheerio');
 const fs = require('fs');
 const path = require('path');
 const ExcelJS = require('exceljs');
@@ -39,6 +40,12 @@ const SITES = [
     { magaza_adi: "İda Solar", url: "https://www.idasolar.com", type: "custom", sel: { kart: '.card-product', isim: '.title', fiyat: '.sale-price' } }
 ];
 
+const axiosConfig = {
+    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
+    timeout: 15000,
+    validateStatus: () => true
+};
+
 let scrapingStatus = { isRunning: false, clients: [] };
 
 function sendSSE(data) {
@@ -73,37 +80,66 @@ function veriTemizle(isim, link, fiyatText) {
     return { isim: isim.replace(/\n/g, ' ').trim(), fiyatNum: floatVal, link: link };
 }
 
-async function scrapeIdeasoft(page, site) {
-    let siteUrunleri = [];
+async function fetchHTML(url) {
     try {
-        const kategoriLinkleri = await page.evaluate(() => {
-            let l = [];
-            if (typeof navigationMenu !== 'undefined' && navigationMenu.categories) {
-                navigationMenu.categories.forEach(a => { l.push(a.url); if(a.subCategories) a.subCategories.forEach(sub => l.push(sub.url)); });
+        const response = await axios.get(url, axiosConfig);
+        return cheerio.load(response.data);
+    } catch (e) {
+        return null;
+    }
+}
+
+async function scrapeIdeasoft(site) {
+    let siteUrunleri = [];
+    let kategoriLinkleri = [];
+    
+    try {
+        const response = await axios.get(site.url, axiosConfig);
+        const match = response.data.match(/navigationMenu\s*=\s*(\{.*?\});/);
+        if (match) {
+            const nav = JSON.parse(match[1]);
+            if (nav.categories) {
+                nav.categories.forEach(c => { 
+                    kategoriLinkleri.push(c.url); 
+                    if(c.subCategories) c.subCategories.forEach(sub => kategoriLinkleri.push(sub.url)); 
+                });
             }
-            return l; 
-        });
+        } else {
+            const $ = cheerio.load(response.data);
+            $('a').each((i, el) => {
+                let href = $(el).attr('href');
+                if (href && (href.includes('kategori') || href.includes('urunler'))) {
+                    kategoriLinkleri.push(href);
+                }
+            });
+        }
+        
+        kategoriLinkleri = [...new Set(kategoriLinkleri)];
         
         for (let url of kategoriLinkleri) {
             let sayfa = 1;
             let devam = true;
             let oncekiVeri = "";
             
-            // DİKKAT: Bedava RAM sınırını aşmamak için sayfa derinliği 15'ten 3'e düşürüldü.
-            while(devam && sayfa <= 3) { 
+            while(devam && sayfa <= 5) {
                 try {
-                    let link = site.url + url + (url.includes('?') ? '&' : '?') + 'sayfa=' + sayfa;
-                    await page.goto(link, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                    let tamLink = site.url + url + (url.includes('?') ? '&' : '?') + 'sayfa=' + sayfa;
+                    const $ = await fetchHTML(tamLink);
+                    if (!$) break;
                     
-                    const urunler = await page.evaluate((b) => {
-                        let toplanan = [];
-                        document.querySelectorAll('.showcase').forEach(el => {
-                            const iEl = el.querySelector('.showcase-title a');
-                            let fEl = el.querySelector('.showcase-price-new')?.innerText || el.querySelector('.showcase-price')?.innerText;
-                            if (iEl && fEl) toplanan.push({ urun_adi: iEl.innerText, fiyat_guncel: fEl, link: iEl.href.startsWith('http') ? iEl.href : b + iEl.getAttribute('href') });
-                        });
-                        return toplanan;
-                    }, site.url);
+                    let urunler = [];
+                    $('.showcase').each((i, el) => {
+                        const iEl = $(el).find('.showcase-title a');
+                        const fElNew = $(el).find('.showcase-price-new').text();
+                        const fElOld = $(el).find('.showcase-price').text();
+                        const fText = fElNew || fElOld;
+                        
+                        if (iEl.length && fText) {
+                            let uLink = iEl.attr('href');
+                            if (uLink && !uLink.startsWith('http')) uLink = site.url + uLink;
+                            urunler.push({ urun_adi: iEl.text().trim(), fiyat_guncel: fText.trim(), link: uLink });
+                        }
+                    });
                     
                     let guncelVeri = JSON.stringify(urunler);
                     if(urunler.length === 0 || guncelVeri === oncekiVeri) {
@@ -116,69 +152,87 @@ async function scrapeIdeasoft(page, site) {
                 } catch (e) { devam = false; }
             }
         }
-    } catch(e){}
+    } catch(e) {}
     return siteUrunleri;
 }
 
-async function scrapeHeuristic(page, site) {
+async function scrapeHeuristic(site) {
     let siteUrunleri = [];
     try {
-        const kategoriLinkleri = await page.evaluate(() => {
-            const host = window.location.hostname;
-            return [...new Set(Array.from(document.querySelectorAll('a')).map(a => a.href).filter(h => {
-                try { const u = new URL(h); const p = u.pathname.toLowerCase(); return u.hostname === host && (p.includes('kategori') || p.includes('urunler') || p.split('/').length > 2) && !p.includes('sepet'); } catch(e){ return false; }
-            }))];
+        const $home = await fetchHTML(site.url);
+        if (!$home) return siteUrunleri;
+        
+        let kategoriLinkleri = [];
+        const host = new URL(site.url).hostname;
+        
+        $home('a').each((i, el) => {
+            let href = $home(el).attr('href');
+            if (!href) return;
+            try {
+                let u = new URL(href, site.url);
+                let p = u.pathname.toLowerCase();
+                if (u.hostname === host && (p.includes('kategori') || p.includes('urunler') || p.split('/').length > 2) && !p.includes('sepet')) {
+                    kategoriLinkleri.push(u.href);
+                }
+            } catch(e) {}
         });
+        
+        kategoriLinkleri = [...new Set(kategoriLinkleri)].slice(0, 20);
+        
         for (let url of kategoriLinkleri) {
             try {
-                await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-                const urunler = await page.evaluate(() => {
-                    let toplanan = [];
-                    Array.from(document.querySelectorAll('span, div, p, b')).forEach(el => {
-                        const t = el.innerText.trim();
-                        if (/(?=.*\d)(TL|₺|TRY)/i.test(t) && t.length < 30) {
-                            let k = el.parentElement; let limit = 0;
-                            while (k && k.tagName !== 'BODY' && limit < 8) { if (k.querySelector('a')) break; k = k.parentElement; limit++; }
-                            if (k && k.tagName !== 'BODY') {
-                                const a = k.querySelector('a');
-                                if (a && a.innerText.trim().length > 5) toplanan.push({ urun_adi: a.innerText.trim(), fiyat_guncel: t, link: a.href });
+                const $ = await fetchHTML(url);
+                if (!$) continue;
+                
+                $('span, div, p, b').each((i, el) => {
+                    let text = $(el).text().trim();
+                    if (/(?=.*\d)(TL|₺|TRY)/i.test(text) && text.length < 30) {
+                        let kart = $(el).parent();
+                        let limit = 0;
+                        let aTag = null;
+                        
+                        while (kart.length && kart[0].name !== 'body' && limit < 8) {
+                            aTag = kart.find('a');
+                            if (aTag.length > 0) break;
+                            kart = kart.parent();
+                            limit++;
+                        }
+                        
+                        if (aTag && aTag.length > 0) {
+                            let uAdi = aTag.first().text().trim();
+                            let uLink = aTag.first().attr('href');
+                            if (uAdi.length > 5 && uLink) {
+                                if (!uLink.startsWith('http')) uLink = new URL(uLink, site.url).href;
+                                siteUrunleri.push({ urun_adi: uAdi, fiyat_guncel: text, link: uLink });
                             }
                         }
-                    });
-                    return toplanan;
+                    }
                 });
-                siteUrunleri = siteUrunleri.concat(urunler);
-            } catch (e) { }
+            } catch (e) {}
         }
     } catch(e){}
     return siteUrunleri;
 }
 
-async function scrapeCustom(page, site) {
+async function scrapeCustom(site) {
+    let items = [];
     try {
-        return await page.evaluate((s, url) => {
-            let items = [];
-            document.querySelectorAll(s.kart).forEach(el => {
-                const iEl = el.querySelector(s.isim); const fEl = el.querySelector(s.fiyat);
-                if (iEl && fEl) items.push({ urun_adi: iEl.innerText, fiyat_guncel: fEl.innerText, link: el.querySelector('a')?.href || url });
-            });
-            return items;
-        }, site.sel, site.url);
-    } catch(e) { return []; }
+        const $ = await fetchHTML(site.url);
+        if (!$) return items;
+        
+        $(site.sel.kart).each((i, el) => {
+            const iEl = $(el).find(site.sel.isim);
+            const fEl = $(el).find(site.sel.fiyat);
+            if (iEl.length && fEl.length) {
+                let aTag = $(el).find('a').first();
+                let link = aTag.attr('href') || site.url;
+                if (link && !link.startsWith('http')) link = new URL(link, site.url).href;
+                items.push({ urun_adi: iEl.text().trim(), fiyat_guncel: fEl.text().trim(), link: link });
+            }
+        });
+    } catch(e) {}
+    return items;
 }
-
-const launchOptions = { 
-    headless: "new", 
-    args: [
-        '--no-sandbox', 
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--single-process',
-        '--no-zygote',
-        '--js-flags="--max-old-space-size=256"'
-    ] 
-};
 
 app.post('/start', async (req, res) => {
     if (scrapingStatus.isRunning) return res.status(400).json({ error: "Zaten çalışıyor" });
@@ -186,44 +240,23 @@ app.post('/start', async (req, res) => {
     scrapingStatus.isRunning = true;
     
     let globalVeritabani = [];
-    let browser = await puppeteer.launch(launchOptions);
 
     try {
         for (let i = 0; i < SITES.length; i++) {
-            // RAM TEMİZLİĞİ: Her 3 sitede bir tarayıcıyı kapatıp açarak belleği sıfırla.
-            if (i > 0 && i % 3 === 0) {
-                await browser.close();
-                browser = await puppeteer.launch(launchOptions);
-            }
-
             const site = SITES[i];
             sendSSE({ type: 'info', msg: `Taranıyor: ${site.magaza_adi}`, percent: Math.round(((i + 1) / SITES.length) * 100) });
             
-            const page = await browser.newPage();
-            await page.setRequestInterception(true);
-            page.on('request', (request) => {
-                if (['image', 'stylesheet', 'font', 'media'].includes(request.resourceType())) {
-                    request.abort();
-                } else {
-                    request.continue();
-                }
-            });
-            await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64)');
-            
             let hamUrunler = [];
             try {
-                await page.goto(site.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-                if (site.type === "ideasoft") hamUrunler = await scrapeIdeasoft(page, site);
-                else if (site.type === "heuristic") hamUrunler = await scrapeHeuristic(page, site);
-                else if (site.type === "custom") hamUrunler = await scrapeCustom(page, site);
+                if (site.type === "ideasoft") hamUrunler = await scrapeIdeasoft(site);
+                else if (site.type === "heuristic") hamUrunler = await scrapeHeuristic(site);
+                else if (site.type === "custom") hamUrunler = await scrapeCustom(site);
 
                 hamUrunler.forEach(u => {
                     let temiz = veriTemizle(u.urun_adi, u.link, u.fiyat_guncel);
                     if (temiz) globalVeritabani.push({ magaza: site.magaza_adi, urun_adi: temiz.isim, fiyat_num: temiz.fiyatNum, link: temiz.link });
                 });
             } catch (e) {
-            } finally {
-                await page.close();
             }
         }
 
@@ -245,7 +278,6 @@ app.post('/start', async (req, res) => {
     } catch (err) {
         sendSSE({ type: 'info', msg: "Hata oluştu", percent: 0 });
     } finally {
-        if(browser) await browser.close();
         scrapingStatus.isRunning = false;
     }
 });
