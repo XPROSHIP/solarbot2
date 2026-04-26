@@ -6,7 +6,6 @@ const path = require('path');
 const ExcelJS = require('exceljs');
 
 const app = express();
-// Render'ın atadığı portu kullan, yoksa 3000'i kullan
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
@@ -17,7 +16,6 @@ app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// --- TÜM SİTELER ---
 const SITES = [
     { magaza_adi: "Kamu Solar", url: "https://www.kamusolar.com", type: "ideasoft" },
     { magaza_adi: "Global Enerji", url: "https://www.globalenerjimarketim.com", type: "ideasoft" },
@@ -51,12 +49,11 @@ app.get('/progress', (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
-    res.flushHeaders(); // RENDER PROXY'SİNİ AÇIK TUTMAK İÇİN ŞART
+    res.flushHeaders();
     scrapingStatus.clients.push(res);
     req.on('close', () => { scrapingStatus.clients = scrapingStatus.clients.filter(c => c !== res); });
 });
 
-// HASSAS VERİ TEMİZLEME ALGORİTMASI
 function veriTemizle(isim, link, fiyatText) {
     if (!isim || !link || !fiyatText) return null;
     let upIsim = isim.toUpperCase().trim();
@@ -76,7 +73,6 @@ function veriTemizle(isim, link, fiyatText) {
     return { isim: isim.replace(/\n/g, ' ').trim(), fiyatNum: floatVal, link: link };
 }
 
-// SCRAPING MANTIKLARI
 async function scrapeIdeasoft(page, site) {
     let siteUrunleri = [];
     try {
@@ -87,20 +83,37 @@ async function scrapeIdeasoft(page, site) {
             }
             return l; 
         });
+        
         for (let url of kategoriLinkleri) {
-            try {
-                await page.goto(site.url + url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-                const urunler = await page.evaluate((b) => {
-                    let toplanan = [];
-                    document.querySelectorAll('.showcase').forEach(el => {
-                        const iEl = el.querySelector('.showcase-title a');
-                        let fEl = el.querySelector('.showcase-price-new')?.innerText || el.querySelector('.showcase-price')?.innerText;
-                        if (iEl && fEl) toplanan.push({ urun_adi: iEl.innerText, fiyat_guncel: fEl, link: iEl.href.startsWith('http') ? iEl.href : b + iEl.getAttribute('href') });
-                    });
-                    return toplanan;
-                }, site.url);
-                siteUrunleri = siteUrunleri.concat(urunler);
-            } catch (e) { }
+            let sayfa = 1;
+            let devam = true;
+            let oncekiVeri = "";
+            
+            while(devam && sayfa <= 15) { 
+                try {
+                    let link = site.url + url + (url.includes('?') ? '&' : '?') + 'sayfa=' + sayfa;
+                    await page.goto(link, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                    
+                    const urunler = await page.evaluate((b) => {
+                        let toplanan = [];
+                        document.querySelectorAll('.showcase').forEach(el => {
+                            const iEl = el.querySelector('.showcase-title a');
+                            let fEl = el.querySelector('.showcase-price-new')?.innerText || el.querySelector('.showcase-price')?.innerText;
+                            if (iEl && fEl) toplanan.push({ urun_adi: iEl.innerText, fiyat_guncel: fEl, link: iEl.href.startsWith('http') ? iEl.href : b + iEl.getAttribute('href') });
+                        });
+                        return toplanan;
+                    }, site.url);
+                    
+                    let guncelVeri = JSON.stringify(urunler);
+                    if(urunler.length === 0 || guncelVeri === oncekiVeri) {
+                        devam = false;
+                    } else {
+                        siteUrunleri = siteUrunleri.concat(urunler);
+                        oncekiVeri = guncelVeri;
+                        sayfa++;
+                    }
+                } catch (e) { devam = false; }
+            }
         }
     } catch(e){}
     return siteUrunleri;
@@ -153,21 +166,21 @@ async function scrapeCustom(page, site) {
     } catch(e) { return []; }
 }
 
-// ANA İŞLEM BAŞLATICI
 app.post('/start', async (req, res) => {
     if (scrapingStatus.isRunning) return res.status(400).json({ error: "Zaten çalışıyor" });
     res.json({ success: true });
     scrapingStatus.isRunning = true;
     
     let globalVeritabani = [];
-const browser = await puppeteer.launch({ 
+    const browser = await puppeteer.launch({ 
         headless: "new", 
         args: [
             '--no-sandbox', 
             '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage', // Render çökmesini engeller (RAM kısıtlamasını aşar)
-            '--disable-gpu',           // Sunucuda ekran kartı olmadığı için şart
-            '--single-process'         // RAM tüketimini minimuma indirir
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--single-process',
+            '--no-zygote'
         ] 
     });
 
@@ -177,6 +190,14 @@ const browser = await puppeteer.launch({
             sendSSE({ type: 'info', msg: `Taranıyor: ${site.magaza_adi}`, percent: Math.round(((i + 1) / SITES.length) * 100) });
             
             const page = await browser.newPage();
+            await page.setRequestInterception(true);
+            page.on('request', (request) => {
+                if (['image', 'stylesheet', 'font', 'media'].includes(request.resourceType())) {
+                    request.abort();
+                } else {
+                    request.continue();
+                }
+            });
             await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64)');
             
             let hamUrunler = [];
@@ -191,19 +212,15 @@ const browser = await puppeteer.launch({
                     if (temiz) globalVeritabani.push({ magaza: site.magaza_adi, urun_adi: temiz.isim, fiyat_num: temiz.fiyatNum, link: temiz.link });
                 });
             } catch (e) {
-                console.log(`Hata - ${site.magaza_adi}: ${e.message}`);
             } finally {
                 await page.close();
             }
         }
 
-        // Mükerrer Linkleri Temizle
         globalVeritabani = [...new Map(globalVeritabani.map(item => [item.link, item])).values()];
 
-        // JSON Kaydet
         fs.writeFileSync(path.join(__dirname, 'KamuSolar_Veritabani.json'), JSON.stringify(globalVeritabani, null, 2), 'utf-8');
 
-        // Excel Kaydet
         const workbook = new ExcelJS.Workbook();
         const sheet = workbook.addWorksheet('Guncel Fiyatlar');
         sheet.columns = [
@@ -217,7 +234,7 @@ const browser = await puppeteer.launch({
 
         sendSSE({ type: 'done', percent: 100, jsonUrl: '/KamuSolar_Veritabani.json', excelUrl: '/KamuSolar_Rapor.xlsx' });
     } catch (err) {
-        sendSSE({ type: 'info', msg: "Büyük bir hata oluştu: " + err.message, percent: 0 });
+        sendSSE({ type: 'info', msg: "Hata oluştu", percent: 0 });
     } finally {
         await browser.close();
         scrapingStatus.isRunning = false;
