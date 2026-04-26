@@ -42,7 +42,7 @@ const SITES = [
 
 const axiosConfig = {
     headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
-    timeout: 15000,
+    timeout: 10000, // 10 saniye içinde cevap gelmezse acımadan iptal et
     validateStatus: () => true
 };
 
@@ -83,7 +83,8 @@ function veriTemizle(isim, link, fiyatText) {
 async function fetchHTML(url) {
     try {
         const response = await axios.get(url, axiosConfig);
-        return cheerio.load(response.data);
+        if (response.status === 200) return cheerio.load(response.data);
+        return null;
     } catch (e) {
         return null;
     }
@@ -92,9 +93,10 @@ async function fetchHTML(url) {
 async function scrapeIdeasoft(site) {
     let siteUrunleri = [];
     let kategoriLinkleri = [];
-    
     try {
         const response = await axios.get(site.url, axiosConfig);
+        if (response.status !== 200) return [];
+
         const match = response.data.match(/navigationMenu\s*=\s*(\{.*?\});/);
         if (match) {
             const nav = JSON.parse(match[1]);
@@ -114,26 +116,24 @@ async function scrapeIdeasoft(site) {
             });
         }
         
-        kategoriLinkleri = [...new Set(kategoriLinkleri)];
+        kategoriLinkleri = [...new Set(kategoriLinkleri)].slice(0, 10); // Kısıtlanmış kategori sayısı
         
-        for (let url of kategoriLinkleri) {
+        // Asenkron Eşzamanlı Tarama (Hızlandırmak için)
+        await Promise.all(kategoriLinkleri.map(async (url) => {
             let sayfa = 1;
             let devam = true;
             let oncekiVeri = "";
             
-            while(devam && sayfa <= 5) {
+            while(devam && sayfa <= 3) { // 3 sayfadan fazla derine inme
                 try {
                     let tamLink = site.url + url + (url.includes('?') ? '&' : '?') + 'sayfa=' + sayfa;
                     const $ = await fetchHTML(tamLink);
-                    if (!$) break;
+                    if (!$) { devam = false; break; }
                     
                     let urunler = [];
                     $('.showcase').each((i, el) => {
                         const iEl = $(el).find('.showcase-title a');
-                        const fElNew = $(el).find('.showcase-price-new').text();
-                        const fElOld = $(el).find('.showcase-price').text();
-                        const fText = fElNew || fElOld;
-                        
+                        const fText = $(el).find('.showcase-price-new').text() || $(el).find('.showcase-price').text();
                         if (iEl.length && fText) {
                             let uLink = iEl.attr('href');
                             if (uLink && !uLink.startsWith('http')) uLink = site.url + uLink;
@@ -142,16 +142,11 @@ async function scrapeIdeasoft(site) {
                     });
                     
                     let guncelVeri = JSON.stringify(urunler);
-                    if(urunler.length === 0 || guncelVeri === oncekiVeri) {
-                        devam = false;
-                    } else {
-                        siteUrunleri = siteUrunleri.concat(urunler);
-                        oncekiVeri = guncelVeri;
-                        sayfa++;
-                    }
+                    if(urunler.length === 0 || guncelVeri === oncekiVeri) { devam = false; } 
+                    else { siteUrunleri.push(...urunler); oncekiVeri = guncelVeri; sayfa++; }
                 } catch (e) { devam = false; }
             }
-        }
+        }));
     } catch(e) {}
     return siteUrunleri;
 }
@@ -177,25 +172,23 @@ async function scrapeHeuristic(site) {
             } catch(e) {}
         });
         
-        kategoriLinkleri = [...new Set(kategoriLinkleri)].slice(0, 20);
+        kategoriLinkleri = [...new Set(kategoriLinkleri)].slice(0, 10);
         
-        for (let url of kategoriLinkleri) {
+        await Promise.all(kategoriLinkleri.map(async (url) => {
             try {
                 const $ = await fetchHTML(url);
-                if (!$) continue;
+                if (!$) return;
                 
                 $('span, div, p, b').each((i, el) => {
                     let text = $(el).text().trim();
                     if (/(?=.*\d)(TL|₺|TRY)/i.test(text) && text.length < 30) {
                         let kart = $(el).parent();
-                        let limit = 0;
-                        let aTag = null;
+                        let limit = 0; let aTag = null;
                         
                         while (kart.length && kart[0].name !== 'body' && limit < 8) {
                             aTag = kart.find('a');
                             if (aTag.length > 0) break;
-                            kart = kart.parent();
-                            limit++;
+                            kart = kart.parent(); limit++;
                         }
                         
                         if (aTag && aTag.length > 0) {
@@ -209,7 +202,7 @@ async function scrapeHeuristic(site) {
                     }
                 });
             } catch (e) {}
-        }
+        }));
     } catch(e){}
     return siteUrunleri;
 }
@@ -234,31 +227,52 @@ async function scrapeCustom(site) {
     return items;
 }
 
+// Promise tabanlı Concurrency (Eşzamanlılık) Kontrolcüsü
+async function runWithConcurrency(tasks, limit) {
+    const results = [];
+    const executing = [];
+    for (const task of tasks) {
+        const p = Promise.resolve().then(() => task());
+        results.push(p);
+        if (limit <= tasks.length) {
+            const e = p.then(() => executing.splice(executing.indexOf(e), 1));
+            executing.push(e);
+            if (executing.length >= limit) await Promise.race(executing);
+        }
+    }
+    return Promise.all(results);
+}
+
 app.post('/start', async (req, res) => {
     if (scrapingStatus.isRunning) return res.status(400).json({ error: "Zaten çalışıyor" });
     res.json({ success: true });
     scrapingStatus.isRunning = true;
     
     let globalVeritabani = [];
+    let completedSites = 0;
+
+    // Aynı anda 4 siteyi birden tarayarak hızı katla
+    const tasks = SITES.map(site => async () => {
+        let hamUrunler = [];
+        try {
+            if (site.type === "ideasoft") hamUrunler = await scrapeIdeasoft(site);
+            else if (site.type === "heuristic") hamUrunler = await scrapeHeuristic(site);
+            else if (site.type === "custom") hamUrunler = await scrapeCustom(site);
+
+            hamUrunler.forEach(u => {
+                let temiz = veriTemizle(u.urun_adi, u.link, u.fiyat_guncel);
+                if (temiz) globalVeritabani.push({ magaza: site.magaza_adi, urun_adi: temiz.isim, fiyat_num: temiz.fiyatNum, link: temiz.link });
+            });
+        } catch (e) {
+            console.log(`${site.magaza_adi} atlandı (Hata veya Zaman Aşımı)`);
+        } finally {
+            completedSites++;
+            sendSSE({ type: 'info', msg: `Taranan: ${site.magaza_adi}`, percent: Math.round((completedSites / SITES.length) * 100) });
+        }
+    });
 
     try {
-        for (let i = 0; i < SITES.length; i++) {
-            const site = SITES[i];
-            sendSSE({ type: 'info', msg: `Taranıyor: ${site.magaza_adi}`, percent: Math.round(((i + 1) / SITES.length) * 100) });
-            
-            let hamUrunler = [];
-            try {
-                if (site.type === "ideasoft") hamUrunler = await scrapeIdeasoft(site);
-                else if (site.type === "heuristic") hamUrunler = await scrapeHeuristic(site);
-                else if (site.type === "custom") hamUrunler = await scrapeCustom(site);
-
-                hamUrunler.forEach(u => {
-                    let temiz = veriTemizle(u.urun_adi, u.link, u.fiyat_guncel);
-                    if (temiz) globalVeritabani.push({ magaza: site.magaza_adi, urun_adi: temiz.isim, fiyat_num: temiz.fiyatNum, link: temiz.link });
-                });
-            } catch (e) {
-            }
-        }
+        await runWithConcurrency(tasks, 4); // Aynı anda 4 site
 
         globalVeritabani = [...new Map(globalVeritabani.map(item => [item.link, item])).values()];
         fs.writeFileSync(path.join(__dirname, 'KamuSolar_Veritabani.json'), JSON.stringify(globalVeritabani, null, 2), 'utf-8');
@@ -276,12 +290,12 @@ app.post('/start', async (req, res) => {
 
         sendSSE({ type: 'done', percent: 100, jsonUrl: '/KamuSolar_Veritabani.json', excelUrl: '/KamuSolar_Rapor.xlsx' });
     } catch (err) {
-        sendSSE({ type: 'info', msg: "Hata oluştu", percent: 0 });
+        sendSSE({ type: 'info', msg: "Kritik Hata Oluştu", percent: 0 });
     } finally {
         scrapingStatus.isRunning = false;
     }
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Sunucu http://0.0.0.0:${PORT} adresinde aktif. Dış bağlantılara açık.`);
+    console.log(`Sunucu http://0.0.0.0:${PORT} adresinde aktif.`);
 });
