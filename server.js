@@ -6,7 +6,8 @@ const path = require('path');
 const ExcelJS = require('exceljs');
 
 const app = express();
-const PORT = 80;
+// Render'ın atadığı portu kullan, yoksa 3000'i kullan
+const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
@@ -158,7 +159,16 @@ app.post('/start', async (req, res) => {
     scrapingStatus.isRunning = true;
     
     let globalVeritabani = [];
-    const browser = await puppeteer.launch({ headless: "new", args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+const browser = await puppeteer.launch({ 
+        headless: "new", 
+        args: [
+            '--no-sandbox', 
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage', // Render çökmesini engeller (RAM kısıtlamasını aşar)
+            '--disable-gpu',           // Sunucuda ekran kartı olmadığı için şart
+            '--single-process'         // RAM tüketimini minimuma indirir
+        ] 
+    });
 
     try {
         for (let i = 0; i < SITES.length; i++) {
